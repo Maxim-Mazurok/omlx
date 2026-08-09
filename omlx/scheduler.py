@@ -49,7 +49,7 @@ from mlx_lm.sample_utils import make_logits_processors
 from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
-from .cache.prefix_cache import BlockAwarePrefixCache
+from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
 from .exceptions import (
     PrefillMemoryExceededError,
     describe_ceiling_binding,
@@ -356,6 +356,7 @@ try:
         MemoryMonitor,
         collect_kv_layer_specs,
         estimate_mla_kv_bytes_per_token,
+        make_prefill_memory_profile,
     )
 
     HAS_TIERED_CACHE = True
@@ -365,6 +366,7 @@ except ImportError:
     MemoryMonitor = None
     collect_kv_layer_specs = None
     estimate_mla_kv_bytes_per_token = None
+    make_prefill_memory_profile = None
     HAS_TIERED_CACHE = False
 
 # Import cache type handlers for hybrid cache support
@@ -2294,6 +2296,14 @@ class Scheduler:
                     gate.note_done()
                 drained = True
         self._pending_async_removes = pending
+        if drained:
+            # The completion-time deferred clear may have already fired while
+            # the async store worker still owned extracted KV buffers. Anchor
+            # another ordinary deferred clear to the point where those final
+            # references are actually released; clearing earlier cannot
+            # reclaim them and leaves the next route preflight charging both
+            # requests until macOS eventually settles the footprint.
+            self._schedule_deferred_metal_clear()
         return drained
 
     def _calculate_max_blocks(self) -> int:
@@ -2643,9 +2653,22 @@ class Scheduler:
             return None
 
         if request_id not in self._output_parser_sessions:
-            self._output_parser_sessions[request_id] = (
-                self._output_parser_factory.create_session(self.tokenizer)
-            )
+            request = self.requests.get(request_id)
+            create_with_tools = self._output_parser_factory.create_session_with_tools
+            if create_with_tools is not None:
+                parser_session = create_with_tools(
+                    self.tokenizer,
+                    request.tools if request is not None else None,
+                )
+            else:
+                parser_session = self._output_parser_factory.create_session(
+                    self.tokenizer
+                )
+            if request is not None and getattr(request, "needs_think_prefix", False):
+                notify = getattr(parser_session, "notify_prefilled_thought", None)
+                if callable(notify):
+                    notify()
+            self._output_parser_sessions[request_id] = parser_session
         return self._output_parser_sessions[request_id]
 
     def _cleanup_output_parser_session(self, request_id: str):
@@ -5496,7 +5519,7 @@ class Scheduler:
         """
         if not snapshot_cache:
             return
-        extracted, _ = self._extract_cache_states(snapshot_cache)
+        extracted, _ = self._extract_snapshot_cache_states(snapshot_cache)
         leaves = self._collect_arrays_from_extracted_cache(extracted)
         if leaves:
             with mx.stream(self._stream):
@@ -5547,7 +5570,7 @@ class Scheduler:
                     request_id,
                     token_count,
                     snapshot_cache,
-                    self._extract_cache_states,
+                    self._extract_snapshot_cache_states,
                     block_size=block_size,
                 )
             if saved:
@@ -5572,6 +5595,7 @@ class Scheduler:
             )
 
         self._boundary_snapshot_required = True
+        self._enable_mtp_boundary_alignment()
         logger.debug(
             "Captured prefill boundary cache snapshot for %s at %s tokens",
             request_id,
@@ -5594,6 +5618,45 @@ class Scheduler:
         self._eval_snapshot_cache(snapshot_cache)
         return snapshot_cache
 
+    def _extract_snapshot_cache_states(
+        self, snapshot_cache: list[Any]
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """Extract snapshot states with sliceable CacheList members blanked.
+
+        Boundary snapshots exist for non-sliceable state; for mixed
+        CacheList layers eligible for per-member block storage the KV
+        member is sliced from the live cache at store time and never read
+        from the snapshot. Persisting it anyway made every boundary
+        snapshot carry the full KV prefix — quadratic in context length
+        across a request's snapshots (RAM transients and the boundary
+        SSD store). Blank those members to ``()``;
+        ``_merge_boundary_with_full_cache`` refills them member-wise when
+        a snapshot is promoted to a store source.
+        """
+        extracted, tokens = self._extract_cache_states(snapshot_cache)
+        for layer in extracted or []:
+            if not isinstance(layer, dict):
+                continue
+            if str(layer.get("class_name") or "") != "CacheList":
+                continue
+            state = layer.get("state")
+            meta = layer.get("meta_state")
+            if not (
+                isinstance(state, list)
+                and isinstance(meta, (list, tuple))
+                and len(meta) >= 1
+                and isinstance(meta[0], (list, tuple))
+            ):
+                continue
+            plan = cachelist_pm_member_plan([str(n) for n in meta[0]], state)
+            if plan is None:
+                continue
+            layer["state"] = [
+                () if mode == "slice" else sub_state
+                for mode, sub_state in zip(plan, state)
+            ]
+        return extracted, tokens
+
     def _decode_boundary_snapshot_value(
         self, snapshot_cache: list[Any], token_count: int, block_size: int
     ) -> Any:
@@ -5605,12 +5668,18 @@ class Scheduler:
         PoolingCache case so its cumulative ``pooled`` tensor can be stored as
         a single-block delta.
         """
+        # Extract eagerly instead of retaining raw cache objects: a raw
+        # CacheList keeps its full KV member alive for every recorded
+        # boundary, which reintroduces the quadratic RAM cost in the
+        # SSD-store-unavailable fallback (#2551). The extraction path runs
+        # the per-member snapshot filter (_extract_snapshot_cache_states),
+        # so pm-eligible layers hold only their small non-sliceable state.
+        value = self._prefill_snapshot_value(snapshot_cache)
         if not _contains_pooling_cache(snapshot_cache):
-            self._eval_snapshot_cache(snapshot_cache)
-            return snapshot_cache
+            return value
 
         return _compact_boundary_snapshot_value(
-            self._prefill_snapshot_value(snapshot_cache),
+            value,
             token_count,
             block_size,
             self._stream,
@@ -5650,7 +5719,7 @@ class Scheduler:
                 mx.default_device()
             )
             with mx.stream(stream):
-                extracted, _ = self._extract_cache_states(snapshot_cache)
+                extracted, _ = self._extract_snapshot_cache_states(snapshot_cache)
                 if not extracted:
                     return None
                 for layer_state in extracted:
@@ -5724,12 +5793,7 @@ class Scheduler:
             # few tokens ahead of the emitted count when a boundary token
             # surfaces, which forces the consistency guard in
             # _extract_boundary_snapshot to skip most captures.
-            block = int(self.config.paged_cache_block_size or 0)
-            if block > 0:
-                try:
-                    self.model._omlx_mtp_commit_align = block
-                except Exception:
-                    pass
+            self._enable_mtp_boundary_alignment()
         else:
             logger.debug(
                 "Boundary cache snapshots disabled (no stateful non-sliceable "
@@ -5737,6 +5801,16 @@ class Scheduler:
             )
 
         return self._boundary_snapshot_required
+
+    def _enable_mtp_boundary_alignment(self) -> None:
+        """Tell MTP decode to expose exact cache state at paged boundaries."""
+        block = int(self.config.paged_cache_block_size or 0)
+        if block <= 0:
+            return
+        try:
+            self.model._omlx_mtp_commit_align = block
+        except Exception:
+            pass
 
     def _extract_boundary_snapshot(
         self, uid: int, expected_tokens: int | None = None
@@ -5839,7 +5913,7 @@ class Scheduler:
                     request.request_id,
                     total_tokens,
                     snapshot_cache,
-                    self._extract_cache_states,
+                    self._extract_snapshot_cache_states,
                     block_size=block_size,
                 )
             if saved:
@@ -5979,7 +6053,7 @@ class Scheduler:
                 provider_tcs.append(tc)
                 continue
 
-            extracted_snapshot, _ = self._extract_cache_states(snap)
+            extracted_snapshot, _ = self._extract_snapshot_cache_states(snap)
             if extracted_snapshot:
                 extracted_in_memory[tc] = extracted_snapshot
                 provider_tcs.append(tc)
@@ -6026,6 +6100,31 @@ class Scheduler:
             if isinstance(state, tuple) and len(state) == 0:
                 # Take full cache layer instead.
                 merged.append(fc)
+                continue
+            # Member-filtered CacheList snapshots
+            # (_extract_snapshot_cache_states) blank sliceable members to
+            # ``()``. Refill those member-wise from the full extracted
+            # layer so the store path sees real KV tensors to slice; the
+            # snapshot's non-sliceable members stay authoritative.
+            full_state = fc.get("state") if isinstance(fc, dict) else None
+            if (
+                isinstance(state, list)
+                and isinstance(full_state, list)
+                and len(state) == len(full_state)
+                and any(
+                    isinstance(s, (list, tuple)) and len(s) == 0 for s in state
+                )
+            ):
+                refilled = dict(bc)
+                refilled["state"] = [
+                    (
+                        full_sub
+                        if isinstance(sub, (list, tuple)) and len(sub) == 0
+                        else sub
+                    )
+                    for sub, full_sub in zip(state, full_state)
+                ]
+                merged.append(refilled)
             else:
                 merged.append(bc)
         return merged
@@ -6036,6 +6135,68 @@ class Scheduler:
             return False
         state = layer_state.get("state", ())
         return isinstance(state, tuple) and len(state) == 0
+
+    @staticmethod
+    def _has_blanked_cachelist_members(layer_state: Any) -> bool:
+        """True for a member-filtered CacheList layer (some sub states ``()``).
+
+        ``_extract_snapshot_cache_states`` blanks the sliceable members of
+        pm-eligible CacheList layers; such a layer is not a whole-layer
+        placeholder (``state`` is a list), so ``_is_empty_boundary_placeholder``
+        does not see it.
+        """
+        if not isinstance(layer_state, dict):
+            return False
+        state = layer_state.get("state")
+        if not isinstance(state, list):
+            return False
+        return any(
+            isinstance(sub, (list, tuple)) and len(sub) == 0 for sub in state
+        )
+
+    @staticmethod
+    def _refill_blanked_cachelist_members(
+        boundary_cache: list[dict[str, Any]],
+        live_cache: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        """Refill member-blanked CacheList layers from the live extracted cache.
+
+        A store source assembled from a member-filtered snapshot needs its
+        blanked sliceable subs refilled before storing — the store path
+        slices KV positionally, so the longer live sequence is a valid
+        source. Only member-blanked CacheList layers are touched;
+        whole-layer placeholders keep going through
+        ``_fill_boundary_placeholders_from_live_cache`` and its
+        sliceable-proof guard. Returns None when the live cache cannot
+        supply a blanked member, so the caller skips the store instead of
+        persisting a partial composite.
+        """
+        if len(boundary_cache) != len(live_cache):
+            return None
+        merged: list[dict[str, Any]] = []
+        for boundary_layer, live_layer in zip(boundary_cache, live_cache):
+            if not Scheduler._has_blanked_cachelist_members(boundary_layer):
+                merged.append(boundary_layer)
+                continue
+            state = boundary_layer.get("state")
+            live_state = (
+                live_layer.get("state") if isinstance(live_layer, dict) else None
+            )
+            if not isinstance(live_state, list) or len(live_state) != len(state):
+                return None
+            refilled = dict(boundary_layer)
+            refilled["state"] = [
+                (
+                    live_sub
+                    if isinstance(sub, (list, tuple)) and len(sub) == 0
+                    else sub
+                )
+                for sub, live_sub in zip(state, live_state)
+            ]
+            if Scheduler._has_blanked_cachelist_members(refilled):
+                return None
+            merged.append(refilled)
+        return merged
 
     @staticmethod
     def _extracted_layer_type_name(layer_state: dict[str, Any]) -> str:
@@ -6198,10 +6359,18 @@ class Scheduler:
                 intermediate_snapshots,
             ) = boundary_override
 
-            live_payload = None
-            if any(
+            needs_placeholder_fill = any(
                 self._is_empty_boundary_placeholder(layer) for layer in boundary_cache
-            ):
+            )
+            # Member-filtered snapshots blank the sliceable subs of
+            # pm-eligible CacheList layers to ``()``. Storing them unfilled
+            # drops the KV member from the block payload, and the resulting
+            # short-payload blocks stay a permanent miss for that prefix
+            # through token-hash dedup until restart.
+            needs_member_refill = any(
+                self._has_blanked_cachelist_members(layer) for layer in boundary_cache
+            )
+            if needs_placeholder_fill or needs_member_refill:
                 live_payload = self._extract_live_request_cache_for_store(
                     request_id,
                     uid,
@@ -6210,12 +6379,21 @@ class Scheduler:
                 if live_payload is None:
                     return None
                 live_cache, live_model_config = live_payload
-                cache_to_store = self._fill_boundary_placeholders_from_live_cache(
-                    boundary_cache,
-                    live_cache,
-                )
-                if cache_to_store is None:
-                    return None
+                cache_to_store = boundary_cache
+                if needs_member_refill:
+                    cache_to_store = self._refill_blanked_cachelist_members(
+                        cache_to_store,
+                        live_cache,
+                    )
+                    if cache_to_store is None:
+                        return None
+                if needs_placeholder_fill:
+                    cache_to_store = self._fill_boundary_placeholders_from_live_cache(
+                        cache_to_store,
+                        live_cache,
+                    )
+                    if cache_to_store is None:
+                        return None
                 model_cache_config = boundary_model_config or live_model_config
             else:
                 cache_to_store = boundary_cache
@@ -6290,6 +6468,29 @@ class Scheduler:
         if isinstance(cache, list):
             if len(cache) == 0:
                 return False
+
+            # Variable-state caches must keep the arity declared by the live
+            # model. Older model implementations can persist an ArraysCache
+            # with fewer (or zero) slots under the same class name; accepting
+            # it reaches the model with missing recurrent state and either
+            # crashes or silently corrupts a cached continuation.
+            try:
+                expected_cache = make_prompt_cache(self.model)
+            except Exception:
+                expected_cache = None
+            if isinstance(expected_cache, (list, tuple)) and len(
+                expected_cache
+            ) == len(cache):
+                arrays_names = {"ArraysCache", "SizedArraysCache"}
+                for layer_cache, expected_layer in zip(cache, expected_cache):
+                    if (
+                        type(expected_layer).__name__ == "ArraysCache"
+                        and type(layer_cache).__name__ in arrays_names
+                        and len(getattr(layer_cache, "state", ()))
+                        != len(getattr(expected_layer, "state", ()))
+                    ):
+                        return False
+
             # Check each layer
             for layer_cache in cache:
                 if layer_cache is None:
@@ -8150,6 +8351,27 @@ class Scheduler:
             or self._pending_pressure_clear
         )
 
+    def has_pending_route_preflight_cleanup(self) -> bool:
+        """Return whether finished-request memory is still being reclaimed.
+
+        Route-level preflight uses this read-only signal to avoid turning a
+        temporary footprint into a final HTTP 400. The engine loop remains the
+        sole owner of async-remove draining and deferred Metal cache clearing.
+        Active requests are intentionally not included: their memory is live
+        and must remain charged to a concurrent admission.
+        """
+        return bool(
+            self._pending_async_removes or self._deferred_clear_at is not None
+        )
+
+    def refresh_route_preflight_usage(self) -> int:
+        """Publish a fresh MLX memory sample for route-level retry.
+
+        The engine wrapper dispatches this method to the owning MLX executor;
+        it must not be called directly from the asyncio event-loop thread.
+        """
+        return self._current_usage_bytes()
+
     def _refresh_generation_overflow_recovery_ids(self) -> None:
         """Drop serial-retry markers once the affected requests leave the scheduler."""
         if not self._generation_overflow_recovery_ids:
@@ -8417,8 +8639,16 @@ class Scheduler:
             charge_tokens = max(1, int(self.config.prefill_step_size))
         else:
             charge_tokens = max(1, self._prefill_min_chunk_tokens)
-        floor_chunk = min(charge_tokens, new_tokens)
-        kv_len = max(int(num_prompt_tokens) - 1, 1)
+        # External prefill evaluates prompt[0:N-1]; the final token is left
+        # for BatchGenerator.insert(). Price the final real prefill chunk and
+        # pass its *pre-chunk* context to _predicted_chunk_transient, which
+        # adds the query width exactly once. Passing N-1 here used to add the
+        # floor chunk twice (issue #2521).
+        prefill_tokens = max(new_tokens - 1, 0)
+        if prefill_tokens == 0:
+            return None
+        floor_chunk = min(charge_tokens, prefill_tokens)
+        kv_len = max(int(num_prompt_tokens) - 1 - floor_chunk, 0)
         kv_exact = int(
             monitor.estimate_resident_kv_bytes(new_tokens, chunk_tokens=floor_chunk)
         )
@@ -9114,6 +9344,25 @@ class Scheduler:
                     cleanup_rope(self.model)
                     request.specprefill_indices = None
                     tracker.remove(request.request_id)
+                    if cache_to_use is not None:
+                        # run_specprefill_target_prefill bases its prefill on
+                        # the restored prefix cache when the request had a
+                        # cache hit (#2443), and may have appended partial KV
+                        # to it in place before failing. Re-prefilling the
+                        # post-hit remainder on top would double-write those
+                        # positions, so drop the hit and prefill the full
+                        # prompt from scratch.
+                        logger.info(
+                            f"Request {request.request_id}: dropping "
+                            f"{request.cached_tokens}-token prefix-cache hit "
+                            "after sparse-prefill failure, re-prefilling the "
+                            "full prompt"
+                        )
+                        cache_to_use = None
+                        request.prompt_cache = None
+                        request.cached_tokens = 0
+                        request.remaining_tokens = request.prompt_token_ids
+                        tokens_to_process = request.prompt_token_ids
                     # Fall through to normal prefill
             # External prefill: process tokens[0:N-1] outside BatchGenerator.
             # Only the last token goes to insert() for the first decode step.
@@ -10764,6 +11013,10 @@ class Scheduler:
             should_clear = True
         if should_clear:
             _sync_and_clear_cache(self._stream)
+            # Route preflight cannot call mx.get_active_memory() from the
+            # event-loop thread, so publish a fresh executor-owned sample once
+            # the deferred pool reclaim has completed.
+            self._current_usage_bytes()
         if (
             self.config.gc_cleanup_interval > 0
             and self._step_counter % self.config.gc_cleanup_interval == 0
@@ -11166,6 +11419,14 @@ class Scheduler:
                 if estimate_mla_kv_bytes_per_token is not None
                 else None
             )
+            prefill_memory_profile = (
+                make_prefill_memory_profile(
+                    config,
+                    compute_dtype_size=base_dtype_size,
+                )
+                if make_prefill_memory_profile is not None
+                else None
+            )
 
             # Truthiness alone isn't enough — MagicMock proxies leaking
             # through the descent (test scaffolds that don't fully spec
@@ -11188,6 +11449,7 @@ class Scheduler:
                     compute_dtype_size=base_dtype_size,
                     kv_bytes_per_token=kv_bytes_per_token,
                     rotating_layer_specs=rotating_layer_specs,
+                    prefill_memory_profile=prefill_memory_profile,
                 )
                 # Fixed recurrent state (GDN/Mamba) can only be measured from
                 # a live cache after the first forward; arm a one-shot probe.
