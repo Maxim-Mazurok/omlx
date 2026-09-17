@@ -203,6 +203,11 @@ from .exceptions import (
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .server_metrics import get_server_metrics, reset_server_metrics
+from .telemetry import (
+    RequestTelemetryCapture,
+    TelemetrySessionRequest,
+    telemetry_manager,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -3894,6 +3899,43 @@ async def create_completion(
         raise
 
 
+@app.post("/v1/telemetry/sessions")
+async def start_telemetry_session(
+    request: TelemetrySessionRequest,
+    _: bool = Depends(verify_api_key),
+):
+    try:
+        return telemetry_manager.start_session(
+            session_id=request.session_id,
+            metadata=request.metadata,
+            sample_interval_seconds=request.sample_interval_seconds,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@app.get("/v1/telemetry/sessions/{session_id}")
+async def get_telemetry_session(
+    session_id: str,
+    _: bool = Depends(verify_api_key),
+):
+    session = telemetry_manager.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Telemetry session not found")
+    return session
+
+
+@app.post("/v1/telemetry/sessions/{session_id}/stop")
+async def stop_telemetry_session(
+    session_id: str,
+    _: bool = Depends(verify_api_key),
+):
+    session = telemetry_manager.stop_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Telemetry session not found")
+    return session
+
+
 @app.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
@@ -3934,6 +3976,16 @@ async def create_chat_completion(
 
     if is_markitdown_model(request.model):
         return await _create_markitdown_chat_completion(request, http_request)
+
+    telemetry_session_id = http_request.headers.get("x-omlx-telemetry-session")
+    if (
+        telemetry_session_id is not None
+        and not telemetry_manager.is_session_active(telemetry_session_id)
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Active telemetry session not found: {telemetry_session_id}",
+        )
 
     request = await _preprocess_markitdown_files_for_llm(request)
 
@@ -4303,6 +4355,11 @@ async def create_chat_completion(
                                 model_load_duration=model_load_duration,
                                 resolved_model=resolved_model,
                                 response_id=response_id,
+                                telemetry_session_id=telemetry_session_id,
+                                telemetry_request_id=(
+                                    http_request.headers.get("x-request-id")
+                                    or response_id
+                                ),
                                 **chat_kwargs,
                             ),
                             http_request=http_request,
@@ -5241,6 +5298,8 @@ async def stream_chat_completion(
     model_load_duration: float = 0.0,
     resolved_model: Optional[str] = None,
     response_id: Optional[str] = None,
+    telemetry_session_id: str | None = None,
+    telemetry_request_id: str | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -5277,6 +5336,11 @@ async def stream_chat_completion(
     # Reuse the id pre-minted by the caller (so the keepalive frame can share
     # it); otherwise mint one for direct/non-streaming callers.
     response_id = response_id or f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    telemetry_capture: RequestTelemetryCapture | None = telemetry_manager.begin_request(
+        telemetry_session_id,
+        request_id=telemetry_request_id or response_id,
+        model_id=resolved_model or request.model,
+    )
 
     # First chunk with role
     first_chunk = ChatCompletionChunk(
@@ -5339,6 +5403,8 @@ async def stream_chat_completion(
                     # exact API-observation time. Never substitute end-of-turn.
                     first_token_time = time.perf_counter()
             last_output = output
+            if telemetry_capture is not None:
+                telemetry_capture.observe_output(output)
             if output.tool_calls:
                 # A structured producer is authoritative. Correct engines keep
                 # the explicit capability false; this guard also prevents a
@@ -5489,6 +5555,8 @@ async def stream_chat_completion(
                             yield event
     except Exception as e:
         error_data = _streaming_error_payload(e, "chat streaming")
+        if telemetry_capture is not None:
+            telemetry_capture.finish({}, error=error_data.get("error"))
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -5842,49 +5910,50 @@ async def stream_chat_completion(
             f"stream_visible_ttft={visible_ttft_text}"
         )
 
+        prompt_tokens = last_output.prompt_tokens
+        completion_tokens = last_output.completion_tokens
+        usage = Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=PromptTokensDetails(
+                cached_tokens=last_output.cached_tokens,
+            ),
+            model_load_duration=(
+                round(model_load_duration, 2)
+                if model_load_duration > 1.0
+                else None
+            ),
+            time_to_first_token=(
+                round(model_ttft, 2) if model_ttft is not None else None
+            ),
+            time_to_first_visible_token=(
+                round(visible_ttft, 2) if visible_ttft is not None else None
+            ),
+            total_time=round(total_duration, 2),
+            prompt_eval_duration=round(metric_prefill_duration, 2),
+            generation_duration=round(metric_gen_duration, 2),
+            prompt_tokens_per_second=(
+                round(prompt_tokens / metric_prefill_duration, 2)
+                if metric_prefill_duration > 0
+                else None
+            ),
+            generation_tokens_per_second=(
+                round(completion_tokens / metric_gen_duration, 2)
+                if metric_gen_duration > 0
+                else None
+            ),
+        )
+        if telemetry_capture is not None:
+            telemetry_capture.finish(usage.model_dump(exclude_none=True))
+
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
-            total_time = end_time - start_time
-            pt = last_output.prompt_tokens
-            ct = last_output.completion_tokens
             usage_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
                 choices=[],
-                usage=Usage(
-                    prompt_tokens=pt,
-                    completion_tokens=ct,
-                    total_tokens=pt + ct,
-                    prompt_tokens_details=PromptTokensDetails(
-                        cached_tokens=last_output.cached_tokens,
-                    ),
-                    model_load_duration=(
-                        round(model_load_duration, 2)
-                        if model_load_duration > 1.0
-                        else None
-                    ),
-                    time_to_first_token=(
-                        round(model_ttft, 2) if model_ttft is not None else None
-                    ),
-                    time_to_first_visible_token=(
-                        round(visible_ttft, 2)
-                        if visible_ttft is not None
-                        else None
-                    ),
-                    total_time=round(total_time, 2),
-                    prompt_eval_duration=round(metric_prefill_duration, 2),
-                    generation_duration=round(metric_gen_duration, 2),
-                    prompt_tokens_per_second=(
-                        round(pt / metric_prefill_duration, 2)
-                        if metric_prefill_duration > 0
-                        else None
-                    ),
-                    generation_tokens_per_second=(
-                        round(ct / metric_gen_duration, 2)
-                        if metric_gen_duration > 0
-                        else None
-                    ),
-                ),
+                usage=usage,
             )
             yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
 

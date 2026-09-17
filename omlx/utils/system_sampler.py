@@ -506,6 +506,38 @@ class SystemSampler:
             selected = [s for s in self._samples if t0 <= s.t <= t1]
         return aggregate(selected, self.interval_s)
 
+    def raw_window(
+        self,
+        started_at: float,
+        finished_at: float,
+        *,
+        origin: float | None = None,
+    ) -> list[dict]:
+        """Return serializable samples in a monotonic time window."""
+        timestamp_origin = started_at if origin is None else origin
+        with self._lock:
+            selected = [
+                sample
+                for sample in self._samples
+                if started_at <= sample.t <= finished_at
+            ]
+        return [
+            {
+                "elapsed_seconds": sample.t - timestamp_origin,
+                "cpu_total": sample.cpu_total,
+                "cpu_performance": sample.cpu_p,
+                "cpu_efficiency": sample.cpu_e,
+                "gpu_utilization": sample.gpu_util,
+                "thermal_pressure": sample.thermal,
+                "physical_footprint_bytes": sample.phys_footprint,
+                "mlx_active_bytes": sample.mlx_active,
+                "mlx_cache_bytes": sample.mlx_cache,
+                "system_used_bytes": sample.sys_used,
+                "system_wired_bytes": sample.sys_wired,
+            }
+            for sample in selected
+        ]
+
     def run_peak_footprint(self) -> int:
         with self._lock:
             return max((s.phys_footprint for s in self._samples), default=0)

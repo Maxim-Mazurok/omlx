@@ -257,6 +257,34 @@ class TestSamplerLifecycle:
         sampler = SystemSampler(interval_s=0.1)
         assert sampler.window(0.0, 1.0) is None
 
+    def test_raw_window_returns_serializable_samples_with_relative_time(self):
+        sampler = SystemSampler(interval_s=0.1)
+        sampler._samples.extend(
+            [
+                make_sample(t=9.0, footprint=GIB),
+                make_sample(t=10.5, footprint=2 * GIB, mlx_active=GIB),
+                make_sample(t=12.0, footprint=3 * GIB),
+            ]
+        )
+
+        samples = sampler.raw_window(10.0, 11.0, origin=9.5)
+
+        assert samples == [
+            {
+                "elapsed_seconds": 1.0,
+                "cpu_total": None,
+                "cpu_performance": None,
+                "cpu_efficiency": None,
+                "gpu_utilization": None,
+                "thermal_pressure": None,
+                "physical_footprint_bytes": 2 * GIB,
+                "mlx_active_bytes": GIB,
+                "mlx_cache_bytes": 0,
+                "system_used_bytes": 0,
+                "system_wired_bytes": 0,
+            }
+        ]
+
     def test_window_excludes_samples_outside_the_range(self):
         sampler = SystemSampler(interval_s=1.0)
         sampler._samples.extend([

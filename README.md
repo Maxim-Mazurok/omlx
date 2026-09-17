@@ -279,6 +279,26 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/rerank` | Document reranking |
 | `GET /v1/models` | List available models |
 
+#### Benchmark Telemetry Sessions
+
+External benchmark runners can opt streamed chat requests into a telemetry
+session without changing the OpenAI response format:
+
+1. Start a session with `POST /v1/telemetry/sessions`. The optional JSON body
+  accepts `session_id`, `metadata`, and `sample_interval_seconds`.
+2. Add `X-oMLX-Telemetry-Session: <session_id>` to each
+  `POST /v1/chat/completions` request. Add `X-Request-ID` to correlate the
+  record with a benchmark task; the completion ID is used when it is omitted.
+3. Stop and export the session with
+  `POST /v1/telemetry/sessions/<session_id>/stop`. A running session can be
+  inspected with `GET /v1/telemetry/sessions/<session_id>`.
+
+The exported requests include existing token and timing usage, cumulative
+completion-token observations, and timestamped host samples for CPU, GPU,
+thermal pressure, process footprint, MLX active/cache memory, and system
+memory. These endpoints use the same API-key authentication as the inference
+endpoints. Untagged requests do not collect telemetry.
+
 ### Tool Calling & Structured Output
 
 Supports all function calling formats available in mlx-lm, JSON schema validation, and MCP tool integration. Tool calling requires the model's chat template to support the `tools` parameter. The following model families are auto-detected:
