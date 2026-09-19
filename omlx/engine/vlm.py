@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 
+from ..adapter.output_parser import append_forced_thinking_prefix
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import (
     clean_special_tokens,
@@ -3284,6 +3285,7 @@ class VLMBatchedEngine(BaseEngine):
         chat_template_kwargs: dict[str, Any] | None = None,
         tools: list[dict] | None = None,
         is_partial: bool | None = None,
+        force_thinking: bool = False,
     ) -> Tuple[
         List[int],
         Optional[mx.array],
@@ -3474,6 +3476,13 @@ class VLMBatchedEngine(BaseEngine):
                 formatted_messages,
                 add_generation_prompt=True,
                 **template_kwargs,
+            )
+
+        if force_thinking:
+            prompt = append_forced_thinking_prefix(
+                prompt,
+                self._model_name,
+                forced_thinking_prefix=self._forced_thinking_prefix(),
             )
 
         # Tokenize text and preprocess images and audio
@@ -3987,6 +3996,7 @@ class VLMBatchedEngine(BaseEngine):
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
+            min_thinking_tokens=kwargs.get("min_thinking_tokens", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
         )
@@ -4101,6 +4111,7 @@ class VLMBatchedEngine(BaseEngine):
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
+            min_thinking_tokens=kwargs.get("min_thinking_tokens", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
         )
@@ -4556,6 +4567,7 @@ class VLMBatchedEngine(BaseEngine):
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
+        force_thinking = kwargs.pop("force_thinking", False)
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
@@ -4576,6 +4588,7 @@ class VLMBatchedEngine(BaseEngine):
             chat_template_kwargs=ct_kwargs,
             tools=template_tools,
             is_partial=partial,
+            force_thinking=force_thinking,
         )
 
         if images:

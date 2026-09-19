@@ -3004,6 +3004,22 @@ def _markitdown_virtual_model_status() -> dict:
     }
 
 
+# Opening the reasoning channel does not stop a model from closing it on the
+# first token, so forced thinking also holds the channel open this long.
+DEFAULT_FORCED_MIN_THINKING_TOKENS = 32
+
+
+def _forced_thinking_prefix_for_model_id(
+    model_id: str,
+    config_model_type: str | None = None,
+) -> str | None:
+    """Reasoning-channel opener for a model id, without loading the model."""
+    from .adapter.output_parser import forced_thinking_prefix_for_model
+
+    config = {"model_type": config_model_type} if config_model_type else None
+    return forced_thinking_prefix_for_model(model_id, config)
+
+
 def _markitdown_is_visible() -> bool:
     return markitdown_model_visible(_server_state.global_settings)
 
@@ -3293,6 +3309,11 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                     id=display_id,
                     owned_by="omlx",
                     max_model_len=get_max_context_window(model_id),
+                    force_thinking=bool(
+                        _forced_thinking_prefix_for_model_id(
+                            model_id, m.get("config_model_type")
+                        )
+                    ),
                 )
             )
         if settings_manager:
@@ -3312,6 +3333,9 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                         id=profile_model_id,
                         owned_by="omlx",
                         max_model_len=get_max_context_window(profile_model_id),
+                        force_thinking=bool(
+                            _forced_thinking_prefix_for_model_id(source_model_id)
+                        ),
                     )
                 )
                 existing_ids.add(profile_model_id)
@@ -4027,6 +4051,23 @@ async def create_chat_completion(
         # get reasoning as a separate field; others fall back to <think> inlined
         # in content.
         _entry = get_engine_pool().get_entry(resolved_model)
+        if request.force_thinking and not _forced_thinking_prefix_for_model_id(
+            resolved_model,
+            getattr(_entry, "config_model_type", None) if _entry is not None else None,
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"force_thinking is not supported by model '{resolved_model}'. "
+                    "Only protocols with a known reasoning-channel opener support "
+                    "it; use prompt-level instructions instead."
+                ),
+            )
+        if request.force_thinking and merged_ct_kwargs.get("enable_thinking") is False:
+            raise HTTPException(
+                status_code=422,
+                detail="force_thinking requires thinking to be enabled.",
+            )
         native_reasoning = uses_native_reasoning_content(
             resolved_model,
             config_model_type=(
@@ -4296,6 +4337,15 @@ async def create_chat_completion(
 
         # Forward partial-mode decision to the engine explicitly
         chat_kwargs["is_partial"] = is_partial
+        if request.force_thinking:
+            chat_kwargs["force_thinking"] = True
+            chat_kwargs["min_thinking_tokens"] = (
+                request.min_thinking_tokens
+                if request.min_thinking_tokens is not None
+                else DEFAULT_FORCED_MIN_THINKING_TOKENS
+            )
+        elif request.min_thinking_tokens:
+            chat_kwargs["min_thinking_tokens"] = request.min_thinking_tokens
         chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
             ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
         )

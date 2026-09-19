@@ -12,6 +12,7 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
+from ..adapter.output_parser import append_forced_thinking_prefix
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..model_settings import (
@@ -817,6 +818,29 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
+        force_thinking: bool = False,
+    ) -> str:
+        """Apply chat template, optionally forcing the reasoning channel open."""
+        prompt = self._render_chat_template(
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+        if force_thinking:
+            prompt = append_forced_thinking_prefix(
+                prompt,
+                self._model_name,
+                forced_thinking_prefix=self._forced_thinking_prefix(),
+            )
+        return prompt
+
+    def _render_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
     ) -> str:
         """Apply chat template to messages.
 
@@ -1035,6 +1059,7 @@ class BatchedEngine(BaseEngine):
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
+            min_thinking_tokens=kwargs.get("min_thinking_tokens", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
         )
@@ -1115,6 +1140,7 @@ class BatchedEngine(BaseEngine):
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
+            min_thinking_tokens=kwargs.get("min_thinking_tokens", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
         )
@@ -1243,6 +1269,7 @@ class BatchedEngine(BaseEngine):
             template_tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
+            force_thinking=kwargs.pop("force_thinking", False),
         )
 
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
@@ -1296,6 +1323,7 @@ class BatchedEngine(BaseEngine):
             template_tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
+            force_thinking=kwargs.get("force_thinking", False),
         )
         # Tokenizer errors (UnicodeDecodeError, HF Rust "Already borrowed",
         # malformed input) are normally surfaced by the real chat path's
@@ -1401,6 +1429,7 @@ class BatchedEngine(BaseEngine):
             template_tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
+            force_thinking=kwargs.pop("force_thinking", False),
         )
 
         # SpecPrefill: protect the system-prompt region from token dropping.

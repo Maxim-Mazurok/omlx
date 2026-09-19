@@ -233,6 +233,18 @@ class BaseEngine(ABC):
 
         return False
 
+    def _forced_thinking_prefix(self) -> str | None:
+        """Reasoning-channel opener from the loaded protocol parser, if any."""
+        scheduler = getattr(
+            getattr(getattr(self, "_engine", None), "engine", None),
+            "scheduler",
+            None,
+        )
+        factory = getattr(scheduler, "_output_parser_factory", None)
+        if factory is None:
+            factory = getattr(self, "_output_parser_factory", None)
+        return getattr(factory, "forced_thinking_prefix", None)
+
     @property
     @abstractmethod
     def model_name(self) -> str:

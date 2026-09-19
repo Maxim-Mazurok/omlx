@@ -412,6 +412,7 @@ class ThinkingBudgetProcessor:
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
         token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
+        minimum_tokens: int = 0,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -421,6 +422,7 @@ class ThinkingBudgetProcessor:
             + (trailing_token_ids or [])
         )
         self._budget = budget
+        self._minimum_tokens = max(0, int(minimum_tokens or 0))
         self._think_start_id = think_start_token_id
         self._token_to_piece = token_to_piece
 
@@ -463,6 +465,10 @@ class ThinkingBudgetProcessor:
 
         if self._in_thinking:
             self._thinking_tokens += 1
+            if self._thinking_tokens <= self._minimum_tokens:
+                # Below the floor the model may not leave the channel, so an
+                # opened channel cannot be closed on the very first token.
+                return self._mask_close_tokens(logits, mx)
             if self._thinking_tokens >= self._budget:
                 if self._last_token_utf8_complete:
                     self._forcing = True
@@ -556,6 +562,18 @@ class ThinkingBudgetProcessor:
         forced = mx.full(logits.shape, float("-inf"))
         forced[..., target_id] = 0.0
         return forced
+
+    def _mask_close_tokens(self, logits, mx):
+        """Forbid opening the close-think sequence while below the minimum."""
+        blocked = [self._think_end_ids[0]] if self._think_end_ids else []
+        if self._force_sequence:
+            blocked.append(self._force_sequence[0])
+        if not blocked:
+            return logits
+        masked = mx.array(logits)
+        for token_id in set(blocked):
+            masked[..., token_id] = float("-inf")
+        return masked
 
     # -- Speculative-decoding (vlm_mtp) support -----------------------------
     #

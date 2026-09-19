@@ -77,6 +77,10 @@ class SamplingParams:
     # Thinking budget (None = unlimited thinking)
     thinking_budget: Optional[int] = None
 
+    # Minimum thinking tokens before the model may close the channel
+    # (None/0 = the model decides, which lets it skip reasoning entirely).
+    min_thinking_tokens: Optional[int] = None
+
     # Compiled grammar for constrained decoding (xgrammar CompiledGrammar).
     # Typed as Any to avoid a hard dependency on xgrammar at import time.
     compiled_grammar: Any = None

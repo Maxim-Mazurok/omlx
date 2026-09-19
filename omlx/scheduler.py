@@ -18,6 +18,7 @@ import importlib
 import inspect
 import logging
 import os
+import sys
 import threading
 import time
 from array import array
@@ -6195,8 +6196,9 @@ class Scheduler:
             logits_processors.append(suppress_processor)
 
         # Add thinking budget processor for reasoning models
+        min_thinking_tokens = getattr(sampling_params, "min_thinking_tokens", None)
         if (
-            sampling_params.thinking_budget is not None
+            (sampling_params.thinking_budget is not None or min_thinking_tokens)
             and request is not None
             and (
                 getattr(request, "needs_think_prefix", False)
@@ -6222,11 +6224,16 @@ class Scheduler:
                     trailing_ids = parser_trailing_ids
                 processor = ThinkingBudgetProcessor(
                     think_end_token_ids=think_end_ids,
-                    budget=sampling_params.thinking_budget,
+                    budget=(
+                        sampling_params.thinking_budget
+                        if sampling_params.thinking_budget is not None
+                        else sys.maxsize
+                    ),
                     think_start_token_id=think_start_id,
                     leading_token_ids=leading_ids,
                     trailing_token_ids=trailing_ids,
                     token_to_piece=self._thinking_budget_token_to_piece,
+                    minimum_tokens=min_thinking_tokens or 0,
                 )
                 logits_processors.append(processor)
 

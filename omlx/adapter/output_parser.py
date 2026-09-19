@@ -25,6 +25,38 @@ from .harmony import HarmonyStreamingParser, parse_tool_calls_from_tokens
 
 logger = logging.getLogger(__name__)
 
+# Gemma 4 opens its reasoning channel with this exact marker.
+GEMMA4_FORCED_THINKING_PREFIX = "<|channel>thought\n"
+
+
+def forced_thinking_prefix_for_model(
+    model_name: str,
+    model_config: dict[str, Any] | None = None,
+) -> str | None:
+    """Return the prompt suffix that forces reasoning, if this model supports it.
+
+    Detection is name/config based so callers can advertise the capability
+    without loading the model or its tokenizer.
+    """
+    if is_gemma4_model(model_name, model_config):
+        return GEMMA4_FORCED_THINKING_PREFIX
+    return None
+
+
+def append_forced_thinking_prefix(
+    prompt: str,
+    model_name: str,
+    model_config: dict[str, Any] | None = None,
+    forced_thinking_prefix: str | None = None,
+) -> str:
+    """Append the reasoning-channel opener so generation starts inside it."""
+    prefix = forced_thinking_prefix or forced_thinking_prefix_for_model(
+        model_name, model_config
+    )
+    if not prefix or not isinstance(prompt, str) or prompt.endswith(prefix):
+        return prompt
+    return prompt + prefix
+
 
 def _decode_output_token(tokenizer, detokenizer, token_id: int) -> str:
     if detokenizer is not None:
@@ -89,6 +121,10 @@ class OutputParserFactory:
     # lane) preserve the token ids of these markers and let the parser
     # session remove them instead.
     protocol_marker_texts: tuple[str, ...] = ()
+    # Exact text appended to a rendered prompt to open the reasoning channel
+    # so the model must start inside it.  ``None`` means the protocol has no
+    # safe way to force reasoning and ``force_thinking`` is rejected.
+    forced_thinking_prefix: str | None = None
 
 
 class HarmonyOutputParserSession:
@@ -1393,6 +1429,7 @@ def detect_output_parser(
             thinking_start_text="<|channel>thought",
             thinking_start_output_text="<think>\n",
             thinking_end_text="<channel|>",
+            forced_thinking_prefix=GEMMA4_FORCED_THINKING_PREFIX,
             protocol_marker_texts=(
                 _OPEN_MARKER_BARE,
                 _CLOSE_MARKER,

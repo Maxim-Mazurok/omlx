@@ -355,6 +355,16 @@ class ChatCompletionRequest(BaseModel):
     guided_grammar: Optional[str] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    # oMLX extension: append the model's reasoning-channel opener to the
+    # prompt so generation must start inside the thinking channel.  Only
+    # supported for protocols with a known opener (see
+    # ``forced_thinking_prefix_for_model``); other models must fall back to
+    # prompt-level instructions.
+    force_thinking: bool = False
+    # Minimum reasoning tokens before the model may close the channel. Defaults
+    # to a small floor when force_thinking is set, because opening the channel
+    # alone does not stop a model from closing it on the first token.
+    min_thinking_tokens: Optional[int] = Field(default=None, ge=0)
     # Top-level alias used by OpenAI-compatible clients.
     enable_thinking: Optional[bool] = None
     # OpenAI-compatible reasoning depth; forwarded to the chat template.
@@ -529,6 +539,8 @@ class ModelInfo(BaseModel):
     # effective context window from the listing without a separate call
     # to /v1/models/status (see #1308).
     max_model_len: int | None = None
+    # oMLX extension: whether this model supports `force_thinking`.
+    force_thinking: bool = False
 
 
 class ModelsResponse(BaseModel):
