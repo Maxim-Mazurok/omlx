@@ -2319,7 +2319,7 @@ def _models_from_docstring(fn) -> list[str]:
 
 
 def _grammar_parser_options() -> list[dict] | None:
-    """Return available reasoning parser names from xgrammar.
+    """Return available xgrammar and oMLX reasoning parser names.
 
     Supports both API generations:
 
@@ -2343,14 +2343,19 @@ def _grammar_parser_options() -> list[dict] | None:
     except Exception as e:  # pragma: no cover — defensive
         logger.debug("torch stub install failed: %s", e)
 
+    local_parsers = [
+        {"value": "gemma4", "label": "Gemma 4", "models": ["Gemma 4"]}
+    ]
+
     # Prefer the 0.1.34+ registry so newer parsers (qwen3_6, gemma4,
     # deepseek_v4, ...) are exposed.
     try:
         from xgrammar.builtin_structural_tag import _structural_tag_registry
 
-        return [
+        return local_parsers + [
             {"value": style, "label": style, "models": _models_from_docstring(fn)}
             for style, fn in _structural_tag_registry.items()
+            if style != "gemma4"
         ]
     except Exception as e:
         logger.debug("xgrammar 0.1.34+ registry unavailable: %s", e)
@@ -2360,9 +2365,10 @@ def _grammar_parser_options() -> list[dict] | None:
         from xgrammar import get_builtin_structural_tag_supported_models
 
         supported = get_builtin_structural_tag_supported_models()
-        return [
+        return local_parsers + [
             {"value": style, "label": style, "models": models}
             for style, models in supported.items()
+            if style != "gemma4"
         ]
     except Exception as e:
         logger.warning("xgrammar parser discovery unavailable: %s", e)

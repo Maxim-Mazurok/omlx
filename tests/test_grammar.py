@@ -1521,11 +1521,14 @@ class TestListGrammarParsers:
             resp = client.get("/admin/api/grammar/parsers")
         assert resp.status_code == 200
         data = resp.json()
-        assert {p["value"] for p in data} == {"qwen3_6", "harmony", "mystery"}
+        assert {p["value"] for p in data} == {
+            "qwen3_6", "harmony", "mystery", "gemma4"
+        }
         by_value = {p["value"]: p for p in data}
         assert by_value["qwen3_6"]["models"] == ["Qwen3.6"]
         assert by_value["harmony"]["models"] == ["gpt-oss"]
         assert by_value["mystery"]["models"] == []
+        assert by_value["gemma4"]["models"] == ["Gemma 4"]
 
     def test_falls_back_to_legacy_helper_when_registry_missing(self, client):
         # xgrammar 0.1.32–0.1.33 path: registry submodule doesn't exist,
@@ -1552,3 +1555,4 @@ class TestListGrammarParsers:
         by_value = {p["value"]: p for p in data}
         assert by_value["qwen"]["models"] == ["Qwen3"]
         assert by_value["harmony"]["models"] == ["gpt-oss"]
+        assert by_value["gemma4"]["models"] == ["Gemma 4"]

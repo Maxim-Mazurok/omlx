@@ -312,6 +312,28 @@ Models not listed above may still work if their chat template accepts `tools` an
 
 A bare JSON, EBNF, or regex grammar constrains the answer from the first generated token, so `thinking_budget` is ignored. Configure a compatible `reasoning_parser` to combine constrained output with a separate, budgeted reasoning phase.
 
+Qwen3.5 dense and MoE models, including text-only variants, automatically use
+the `qwen_3_5` grammar parser when the merged request settings explicitly enable
+thinking and no `reasoning_parser` is configured. Send
+`chat_template_kwargs.enable_thinking: true` to allow reasoning before
+`</think>` while constraining the final answer to the requested format.
+Explicit parser settings take precedence. Disabling or omitting thinking does
+not automatically add a reasoning phase; this preserves small models'
+non-thinking default.
+
+Gemma 4 models automatically use oMLX's `gemma4` grammar parser when no
+`reasoning_parser` is configured. It is also selectable in the model settings.
+With `chat_template_kwargs.enable_thinking: true`, the grammar allows the
+`<|channel>thought` reasoning channel until `<channel|>`, then enforces the
+requested JSON schema, EBNF, or regex on the final answer. A thinking budget can
+close that channel without disabling answer constraints. With thinking disabled,
+constraints apply immediately after the prompt's empty thought channel.
+This parser is implemented in oMLX and does not require xgrammar to register a
+Gemma builtin; xgrammar itself is still required. Set `thinking_budget` and
+`max_tokens` in the request, leaving room for both reasoning and the final answer.
+`response_format` retains its warning-header/prompt-injection fallback when
+grammar compilation is unavailable; use `structured_outputs` to reject that case.
+
 ## Models
 
 Point `--model-dir` at a directory containing MLX-format model subdirectories. Two-level organization folders (e.g., `mlx-community/model-name/`) are also supported. GGUF files in these folders are listed one model per file and run on an [external engine](docs/Splash.md#gguf-models).

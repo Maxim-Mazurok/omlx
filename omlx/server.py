@@ -5142,7 +5142,9 @@ async def create_chat_completion(
             structured_outputs is not None or response_format
         ):
             await engine.start()
-            reasoning_parser = _grammar_reasoning_parser(engine, reasoning_parser)
+            reasoning_parser = _grammar_reasoning_parser(
+                engine, reasoning_parser, merged_ct_kwargs
+            )
         compiled_grammar = (
             None
             if native_response_format is not None
@@ -5809,12 +5811,33 @@ def _end_harmony_final_on_stop(tag_dict: dict) -> None:
             tag["end"] = ""
 
 
-def _grammar_reasoning_parser(engine, reasoning_parser: str | None) -> str | None:
+def _grammar_reasoning_parser(
+    engine,
+    reasoning_parser: str | None,
+    chat_template_kwargs: dict | None = None,
+) -> str | None:
     """Return the structural tag parser for a grammar-constrained request."""
     # gpt-oss output always goes through the Harmony parser, which needs the
     # channel headers that a bare grammar would mask.
     if reasoning_parser is None and engine.model_type == "gpt_oss":
         return "harmony"
+    if reasoning_parser is None and engine.model_type in {
+        "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"
+    }:
+        return "gemma4"
+    # Small Qwen models default to non-thinking, unlike larger variants.
+    # Only add a reasoning phase when the merged request settings enable it.
+    if (
+        reasoning_parser is None
+        and (chat_template_kwargs or {}).get("enable_thinking") is True
+        and engine.model_type in {
+            "qwen3_5",
+            "qwen3_5_text",
+            "qwen3_5_moe",
+            "qwen3_5_moe_text",
+        }
+    ):
+        return "qwen_3_5"
     return reasoning_parser
 
 
@@ -5837,8 +5860,13 @@ def _compile_with_structural_tag(
         reasoning = _minimax_m3_reasoning_mode(ct_kwargs)
     else:
         reasoning = ct_kwargs.get("enable_thinking") is not False
-    tag = xgr.get_builtin_structural_tag(reasoning_parser, reasoning=reasoning)
-    tag_dict = tag.model_dump()
+    if reasoning_parser == "gemma4":
+        from .api.grammar import build_gemma4_structural_tag
+
+        tag_dict = build_gemma4_structural_tag(enable_thinking=reasoning)
+    else:
+        tag = xgr.get_builtin_structural_tag(reasoning_parser, reasoning=reasoning)
+        tag_dict = tag.model_dump()
     _allow_reasoning_opener(tag_dict)
     if reasoning_parser == "harmony":
         _end_harmony_final_on_stop(tag_dict)
@@ -8724,7 +8752,7 @@ async def create_response(
                 if native_response_format is None:
                     await engine.start()
                     reasoning_parser = _grammar_reasoning_parser(
-                        engine, reasoning_parser
+                        engine, reasoning_parser, merged_ct_kwargs
                     )
                     rf = ResponseFormat(**response_format)
                     compiled_grammar = _compile_grammar_for_request(
